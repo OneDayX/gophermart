@@ -21,6 +21,11 @@ const (
 
 	// defaultRetryAfter is how long to wait after a 429 that does not say.
 	defaultRetryAfter = 60 * time.Second
+
+	// maxRetryAfter caps the wait after a 429. The accrual system limits
+	// requests per minute, so a much longer wait is a mistake, and the worker
+	// must not stall until a restart because of it.
+	maxRetryAfter = time.Hour
 )
 
 // Status is the stage of the calculation as the accrual system reports it.
@@ -127,20 +132,30 @@ func (c *Client) Order(ctx context.Context, number string) (OrderAccrual, error)
 }
 
 // parseRetryAfter reads a Retry-After header, which holds either a number of
-// seconds or an HTTP date. A missing or unusable value means the default.
+// seconds or an HTTP date. A missing or unusable value means the default, and
+// a wait longer than maxRetryAfter is cut down to it.
 func parseRetryAfter(header string, now time.Time) time.Duration {
 	header = strings.TrimSpace(header)
 
-	if seconds, err := strconv.Atoi(header); err == nil {
-		if seconds > 0 {
+	// A number too large for an int still means "wait long": Atoi reports it
+	// with ErrRange and returns the largest int of the same sign.
+	if seconds, err := strconv.Atoi(header); err == nil || errors.Is(err, strconv.ErrRange) {
+		// The cap is checked before multiplying: enough seconds overflow the
+		// nanoseconds a time.Duration counts in.
+		switch {
+		case seconds <= 0:
+			return defaultRetryAfter
+		case seconds > int(maxRetryAfter/time.Second):
+			return maxRetryAfter
+		default:
 			return time.Duration(seconds) * time.Second
 		}
-		return defaultRetryAfter
 	}
 
 	if date, err := http.ParseTime(header); err == nil {
+		// Sub saturates instead of overflowing, so only the cap is needed.
 		if wait := date.Sub(now); wait > 0 {
-			return wait
+			return min(wait, maxRetryAfter)
 		}
 	}
 

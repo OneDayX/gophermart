@@ -83,6 +83,7 @@ func TestParseRetryAfter(t *testing.T) {
 		{header: "", want: defaultRetryAfter},
 		{header: "0", want: defaultRetryAfter},
 		{header: "soon", want: defaultRetryAfter},
+		{header: "10000000000", want: maxRetryAfter},
 	}
 
 	for _, tt := range tests {
