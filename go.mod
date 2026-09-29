@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/caarlos0/env/v11 v11.4.1
+	github.com/go-chi/chi/v5 v5.3.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
