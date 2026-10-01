@@ -7,8 +7,6 @@ import (
 	"github.com/OneDayX/gophermart/internal/handler"
 	"github.com/OneDayX/gophermart/internal/models"
 	"github.com/OneDayX/gophermart/internal/server/middleware"
-	"github.com/go-chi/chi/v5"
-	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 )
 
@@ -44,27 +42,16 @@ type services struct {
 // everything else needs a token.
 func newRouter(svc services, log *zap.Logger) http.Handler {
 	h := handler.NewHandler(log)
+	authed := middleware.Auth(svc.tokens, log)
 
-	r := chi.NewRouter()
-	r.Use(middleware.Logger(log))
-	// Inside the logger, so a panic is logged as the 500 it turns into.
-	r.Use(chimw.Recoverer)
-	r.Use(middleware.Gzip)
+	mux := http.NewServeMux()
+	mux.Handle("POST /api/user/register", h.Register(svc.users))
+	mux.Handle("POST /api/user/login", h.Login(svc.users))
+	mux.Handle("POST /api/user/orders", authed(h.UploadOrder(svc.orders)))
+	mux.Handle("GET /api/user/orders", authed(h.ListOrders(svc.orders)))
+	mux.Handle("GET /api/user/balance", authed(h.Balance(svc.balances)))
+	mux.Handle("POST /api/user/balance/withdraw", authed(h.Withdraw(svc.balances)))
+	mux.Handle("GET /api/user/withdrawals", authed(h.Withdrawals(svc.balances)))
 
-	r.Route("/api/user", func(r chi.Router) {
-		r.Post("/register", h.Register(svc.users)) // POST /api/user/register
-		r.Post("/login", h.Login(svc.users))       // POST /api/user/login
-
-		r.Group(func(r chi.Router) {
-			r.Use(middleware.Auth(svc.tokens, log))
-
-			r.Post("/orders", h.UploadOrder(svc.orders))          // POST /api/user/orders
-			r.Get("/orders", h.ListOrders(svc.orders))            // GET /api/user/orders
-			r.Get("/balance", h.Balance(svc.balances))            // GET /api/user/balance
-			r.Post("/balance/withdraw", h.Withdraw(svc.balances)) // POST /api/user/balance/withdraw
-			r.Get("/withdrawals", h.Withdrawals(svc.balances))    // GET /api/user/withdrawals
-		})
-	})
-
-	return r
+	return middleware.Logger(log)(middleware.Gzip(mux))
 }

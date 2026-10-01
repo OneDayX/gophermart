@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/OneDayX/gophermart/internal/config"
 	"github.com/OneDayX/gophermart/internal/database"
@@ -74,17 +73,6 @@ func TestApp_EndToEnd(t *testing.T) {
 	api := httptest.NewServer(a.Handler())
 	defer api.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		a.worker.Run(ctx)
-		close(done)
-	}()
-	defer func() {
-		cancel()
-		<-done
-	}()
-
 	req, err := http.NewRequest(http.MethodPost, api.URL+"/api/user/register", strings.NewReader(`{"login":"alice","password":"secret"}`))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/json")
@@ -101,11 +89,11 @@ func TestApp_EndToEnd(t *testing.T) {
 	code, _ = send(t, http.MethodPost, api.URL+"/api/user/orders", "", "text/plain", "12345678903")
 	assert.Equal(t, http.StatusUnauthorized, code)
 
-	// The worker polls the accrual system once a second.
-	require.Eventually(t, func() bool {
-		_, body := send(t, http.MethodGet, api.URL+"/api/user/orders", token, "", "")
-		return strings.Contains(body, "PROCESSED")
-	}, 10*time.Second, 100*time.Millisecond)
+	// One poll instead of waiting for the ticker of a running worker.
+	a.worker.Poll(context.Background())
+
+	_, body := send(t, http.MethodGet, api.URL+"/api/user/orders", token, "", "")
+	assert.Contains(t, body, `"status":"PROCESSED"`)
 
 	code, _ = send(t, http.MethodPost, api.URL+"/api/user/balance/withdraw", token, "application/json", `{"order":"2377225624","sum":1000}`)
 	assert.Equal(t, http.StatusPaymentRequired, code)
@@ -113,7 +101,7 @@ func TestApp_EndToEnd(t *testing.T) {
 	code, _ = send(t, http.MethodPost, api.URL+"/api/user/balance/withdraw", token, "application/json", `{"order":"2377225624","sum":700}`)
 	assert.Equal(t, http.StatusOK, code)
 
-	_, body := send(t, http.MethodGet, api.URL+"/api/user/balance", token, "", "")
+	_, body = send(t, http.MethodGet, api.URL+"/api/user/balance", token, "", "")
 	var balance struct {
 		Current   float64 `json:"current"`
 		Withdrawn float64 `json:"withdrawn"`
@@ -130,8 +118,9 @@ func TestApp_Run(t *testing.T) {
 	db := newTestDB(t)
 	a := newApp(config.Config{RunAddress: "127.0.0.1:0", AccrualSystemAddress: "http://127.0.0.1:1"}, db, zap.NewNop())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+	// Already cancelled: Run must start everything and shut it down cleanly.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
 	assert.NoError(t, a.Run(ctx))
 }

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/OneDayX/gophermart/internal/accrual"
@@ -73,7 +74,7 @@ func TestWorker_Poll(t *testing.T) {
 		"3": {Order: "3", Status: accrual.StatusProcessed, Accrual: new(500.0)},
 	}}
 
-	New(store, client, nil).poll(context.Background())
+	New(store, client, nil).Poll(context.Background())
 
 	assert.Equal(t, map[string]models.OrderStatus{
 		"1": models.OrderStatusProcessing,
@@ -85,16 +86,21 @@ func TestWorker_Poll(t *testing.T) {
 }
 
 func TestWorker_PausesOnRateLimit(t *testing.T) {
-	store := newFakeStore("1", "2", "3")
-	client := &fakeClient{err: &accrual.RateLimitError{RetryAfter: time.Minute}}
+	synctest.Test(t, func(t *testing.T) {
+		store := newFakeStore("1", "2", "3")
+		client := &fakeClient{err: &accrual.RateLimitError{RetryAfter: time.Minute}}
 
-	w := New(store, client, nil)
-	w.concurrency = 1
-	w.poll(context.Background())
+		w := New(store, client, nil)
+		w.concurrency = 1
+		w.Poll(t.Context())
 
-	assert.Equal(t, int32(1), client.calls.Load(), "after 429 the rest of the batch waits")
-	assert.True(t, w.paused())
-	assert.Empty(t, store.statuses)
+		assert.Equal(t, int32(1), client.calls.Load(), "after 429 the rest of the batch is skipped")
+		assert.True(t, w.paused())
+		assert.Empty(t, store.statuses)
+
+		time.Sleep(time.Minute)
+		assert.False(t, w.paused())
+	})
 }
 
 func TestWorker_SkipsErrors(t *testing.T) {
@@ -103,19 +109,27 @@ func TestWorker_SkipsErrors(t *testing.T) {
 		"1": {Order: "1", Status: "SOMETHING"},
 	}}
 
-	New(store, client, nil).poll(context.Background())
+	New(store, client, nil).Poll(context.Background())
 	assert.Equal(t, map[string]models.OrderStatus{"2": models.OrderStatusNew}, store.statuses,
 		"an order with an unknown status stays as it was")
 
 	store = newFakeStore("1")
-	New(store, &fakeClient{err: errors.New("connection refused")}, nil).poll(context.Background())
+	New(store, &fakeClient{err: errors.New("connection refused")}, nil).Poll(context.Background())
 	assert.Empty(t, store.statuses)
 }
 
-func TestWorker_RunStopsWithContext(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
+func TestWorker_Run(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := &fakeClient{answers: map[string]accrual.OrderAccrual{
+			"1": {Order: "1", Status: accrual.StatusProcessing},
+		}}
 
-	// Returns only after the context is done.
-	New(newFakeStore(), &fakeClient{}, nil).Run(ctx)
+		ctx, cancel := context.WithTimeout(t.Context(), 3500*time.Millisecond)
+		defer cancel()
+
+		New(newFakeStore("1"), client, nil).Run(ctx)
+
+		// Once at the start and then on every tick of the one-second interval.
+		assert.Equal(t, int32(4), client.calls.Load())
+	})
 }

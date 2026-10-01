@@ -5,12 +5,14 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/OneDayX/gophermart/internal/accrual"
 	"github.com/OneDayX/gophermart/internal/models"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -35,8 +37,8 @@ type accrualClient interface {
 }
 
 // Worker checks pending orders with the accrual system. On every tick it takes
-// a batch of them, the ones checked longest ago first, and hands them to a
-// pool of goroutines. When the accrual system answers 429, the whole pool
+// a batch of them, the ones checked longest ago first, and checks up to
+// concurrency of them at once. When the accrual system answers 429, the worker
 // stops asking for as long as the system says.
 type Worker struct {
 	orders orderStore
@@ -69,14 +71,13 @@ func New(orders orderStore, client accrualClient, log *zap.Logger) *Worker {
 }
 
 // Run polls the accrual system until ctx is cancelled, starting at once, so
-// the orders left from a previous run are picked up without a delay. It
-// returns when every goroutine it started has stopped.
+// the orders left from a previous run are picked up without a delay.
 func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
 	for {
-		w.poll(ctx)
+		w.Poll(ctx)
 
 		select {
 		case <-ctx.Done():
@@ -86,9 +87,9 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// poll checks one batch of pending orders and waits until all of them are
+// Poll checks one batch of pending orders and returns when all of them are
 // done, so the next batch never picks an order that is still being checked.
-func (w *Worker) poll(ctx context.Context) {
+func (w *Worker) Poll(ctx context.Context) {
 	if w.paused() {
 		return
 	}
@@ -100,108 +101,78 @@ func (w *Worker) poll(ctx context.Context) {
 		}
 		return
 	}
-	if len(numbers) == 0 {
-		return
-	}
 
-	jobs := make(chan string)
+	// The only error a check returns is a 429. It cancels the group context,
+	// and the rest of the batch is skipped: the accrual system would refuse it
+	// anyway.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(w.concurrency)
 
-	var wg sync.WaitGroup
-	for range min(w.concurrency, len(numbers)) {
-		wg.Go(func() {
-			for number := range jobs {
-				w.check(ctx, number)
-			}
-		})
-	}
-
-	w.dispatch(ctx, numbers, jobs)
-	close(jobs)
-	wg.Wait()
-}
-
-// dispatch hands the numbers to the pool one by one. It stops early when the
-// accrual system asks to wait, since it would refuse the rest anyway.
-func (w *Worker) dispatch(ctx context.Context, numbers []string, jobs chan<- string) {
 	for _, number := range numbers {
-		if w.paused() {
-			return
+		if gctx.Err() != nil {
+			break
 		}
-
-		select {
-		case jobs <- number:
-		case <-ctx.Done():
-			return
-		}
+		g.Go(func() error { return w.check(gctx, number) })
 	}
+
+	_ = g.Wait()
 }
 
-// check asks the accrual system about one order and records the answer. A
-// failure is only logged: the order stays pending and is asked about again.
-func (w *Worker) check(ctx context.Context, number string) {
-	// Another goroutine may have run into the rate limit while this order
-	// was waiting for its turn.
-	if w.paused() {
-		return
+// check asks the accrual system about one order and records the answer. It
+// returns an error only when the accrual system asks to wait; any other
+// failure is logged, and the order stays pending to be asked about again.
+func (w *Worker) check(ctx context.Context, number string) error {
+	// The batch may have been stopped while this order waited for its turn.
+	if ctx.Err() != nil {
+		return nil
 	}
 
-	status, reward, ok := w.ask(ctx, number)
-	if !ok {
-		return
-	}
-
-	if err := w.orders.ApplyAccrual(ctx, number, status, reward); err != nil {
-		if ctx.Err() == nil {
-			w.log.Error("failed to record accrual", zap.String("order", number), zap.Error(err))
-		}
-		return
-	}
-
-	w.log.Debug("order checked", zap.String("order", number), zap.String("status", string(status)))
-}
-
-// ask asks the accrual system about the order and translates the answer into
-// the status of the order and the reward to credit. The flag is false when
-// there is no answer to record.
-func (w *Worker) ask(ctx context.Context, number string) (models.OrderStatus, *float64, bool) {
-	result, err := w.client.Order(ctx, number)
+	status, reward, err := w.ask(ctx, number)
 
 	var rateLimit *accrual.RateLimitError
-	switch {
-	case errors.As(err, &rateLimit):
+	if errors.As(err, &rateLimit) {
 		w.pause(rateLimit.RetryAfter)
 		w.log.Warn("accrual system asks to slow down",
 			zap.String("order", number),
 			zap.Duration("retry_after", rateLimit.RetryAfter),
 		)
-		return "", nil, false
+		return err
+	}
 
+	if err == nil {
+		err = w.orders.ApplyAccrual(ctx, number, status, reward)
+	}
+	if err != nil && ctx.Err() == nil {
+		w.log.Error("failed to check order", zap.String("order", number), zap.Error(err))
+	}
+
+	return nil
+}
+
+// ask asks the accrual system about the order and translates the answer into
+// the status of the order and the reward to credit.
+func (w *Worker) ask(ctx context.Context, number string) (models.OrderStatus, *float64, error) {
+	result, err := w.client.Order(ctx, number)
+
+	switch {
 	case errors.Is(err, accrual.ErrOrderNotRegistered):
 		// The accrual system may register the order later, so it stays NEW;
 		// it is still marked as checked to let the other orders go first.
-		return models.OrderStatusNew, nil, true
-
+		return models.OrderStatusNew, nil, nil
 	case err != nil:
-		if ctx.Err() == nil {
-			w.log.Error("failed to ask the accrual system", zap.String("order", number), zap.Error(err))
-		}
-		return "", nil, false
+		return "", nil, err
 	}
 
 	switch result.Status {
 	case accrual.StatusRegistered, accrual.StatusProcessing:
-		return models.OrderStatusProcessing, nil, true
+		return models.OrderStatusProcessing, nil, nil
 	case accrual.StatusInvalid:
-		return models.OrderStatusInvalid, nil, true
+		return models.OrderStatusInvalid, nil, nil
 	case accrual.StatusProcessed:
 		// Only a processed order has a reward to credit.
-		return models.OrderStatusProcessed, result.Accrual, true
+		return models.OrderStatusProcessed, result.Accrual, nil
 	default:
-		w.log.Error("accrual system reported an unknown status",
-			zap.String("order", number),
-			zap.String("status", string(result.Status)),
-		)
-		return "", nil, false
+		return "", nil, fmt.Errorf("unknown accrual status %q", result.Status)
 	}
 }
 
